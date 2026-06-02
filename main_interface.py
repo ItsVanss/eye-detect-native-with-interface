@@ -1,19 +1,14 @@
 """
-main_inference.py  —  Redesign UI (3-Panel Dashboard)
-=======================================================
-Layout layar penuh dengan 3 panel:
-  ┌─────────────┬──────────────────────┬────────────┐
-  │  TOPBAR                                          │
-  ├─────────────┼──────────────────────┼────────────┤
-  │  LEFT PANEL │   VIDEO UTAMA        │ RIGHT PANEL│
-  │  • Preview  │   + overlay          │ • Prob bars│
-  │    mata     │     wajah/mata       │ • Confidence│
-  │  • Deteksi  │                      │   gauge    │
-  │  • Status   │                      │ • Smoothing│
-  │  • Threshold│                      │            │
-  ├─────────────┴──────────────────────┴────────────┤
-  │  BOTTOMBAR  (info kamera, model, shortcut)      │
-  └──────────────────────────────────────────────────┘
+main_inference.py  —  Redesign UI (3-Panel Dashboard) + Arduino LED Control
+===========================================================================
+Layout layar penuh dengan 3 panel + kontrol LED via Arduino Nano.
+
+  LED Mapping:
+    D9  = Lirik Kiri  (KUNING)
+    D10 = Center      (HIJAU)  
+    D11 = Lirik Kanan (BIRU)
+    
+  Protokol Serial: 'L'=Kiri, 'C'=Center, 'R'=Kanan, 'N'=Off
 """
 
 import cv2
@@ -21,8 +16,14 @@ import numpy as np
 import tensorflow as tf
 import time
 import math
+import serial
+import serial.tools.list_ports
+import glob
+import sys
 
-# ─── KONFIGURASI ───────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# KONFIGURASI
+# ═══════════════════════════════════════════════════════════════════════════════
 IMG_SIZE             = 64
 MODEL_PATH           = "model/eye_tracker.h5"
 LABELS               = ["Lirik Kiri", "Lirik Kanan", "Center"]
@@ -34,26 +35,113 @@ LABEL_COLORS         = {                       # BGR
 CONFIDENCE_THRESHOLD = 0.60
 SMOOTH_WINDOW        = 7
 
-# ─── DIMENSI PANEL ─────────────────────────────────────────────────────────────
+# ─── ARDUINO CONFIG ───────────────────────────────────────────────────────────
+ARDUINO_BAUDRATE     = 9600
+ARDUINO_CMD_MAP      = {
+    "Lirik Kiri" : b'L',   # D9
+    "Center"     : b'C',   # D10
+    "Lirik Kanan": b'R',   # D11
+}
+ARDUINO_CMD_OFF      = b'N'
+
+# Dimensi Panel
 PANEL_LEFT_W  = 200
 PANEL_RIGHT_W = 185
 TOPBAR_H      = 44
 BOTTOMBAR_H   = 34
 
 # Warna tema (BGR) — dark theme
-BG_DARK    = (14,  14,  12)    # latar utama
-BG_PANEL   = (18,  18,  20)    # latar panel samping
-BG_CARD    = (26,  26,  30)    # latar kartu
-BG_VIDEO   = (10,  10,  12)    # latar area video
-LINE_DIM   = (50,  50,  55)    # garis pemisah
-TEXT_PRI   = (220, 218, 210)   # teks primer
-TEXT_SEC   = (130, 128, 120)   # teks sekunder
-TEXT_DIM   = ( 80,  80,  85)   # teks redup
-ACCENT_GRN = ( 80, 222,  74)   # hijau aktif (2 mata)
-ACCENT_YEL = ( 50, 158, 245)   # kuning/oranye (1 mata)
-ACCENT_GRY = (100, 100, 105)   # abu (tidak ada)
+BG_DARK    = (14,  14,  12)
+BG_PANEL   = (18,  18,  20)
+BG_CARD    = (26,  26,  30)
+BG_VIDEO   = (10,  10,  12)
+LINE_DIM   = (50,  50,  55)
+TEXT_PRI   = (220, 218, 210)
+TEXT_SEC   = (130, 128, 120)
+TEXT_DIM   = ( 80,  80,  85)
+ACCENT_GRN = ( 80, 222,  74)
+ACCENT_YEL = ( 50, 158, 245)
+ACCENT_GRY = (100, 100, 105)
+ACCENT_RED = ( 60,  60, 255)  # Arduino disconnect
 
-# ─── LOAD MODEL ────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# ARDUINO HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def find_arduino_port():
+    """Auto-detect Arduino Nano port across platforms."""
+    # Coba port umum berdasarkan OS
+    if sys.platform.startswith('linux'):
+        ports = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
+    elif sys.platform == 'darwin':  # macOS
+        ports = glob.glob('/dev/tty.usbserial*') + glob.glob('/dev/tty.wchusbserial*')
+    elif sys.platform == 'win32':   # Windows
+        ports = [f'COM{i}' for i in range(1, 20)]
+    else:
+        ports = []
+    
+    # Cek port yang tersedia
+    available = [p.device for p in serial.tools.list_ports.comports()]
+    
+    for p in ports:
+        if p in available:
+            try:
+                s = serial.Serial(p, ARDUINO_BAUDRATE, timeout=1)
+                s.close()
+                return p
+            except (OSError, serial.SerialException):
+                continue
+    
+    # Fallback: scan semua port yang terdeteksi
+    for p in available:
+        # Filter berdasarkan nama hardware
+        desc = next((d.description for d in serial.tools.list_ports.comports() 
+                     if d.device == p), "")
+        if any(k in desc.lower() for k in ['arduino', 'ch340', 'ft232', 'usb-serial']):
+            try:
+                s = serial.Serial(p, ARDUINO_BAUDRATE, timeout=1)
+                s.close()
+                return p
+            except (OSError, serial.SerialException):
+                continue
+    
+    return None
+
+def init_arduino():
+    """Inisialisasi koneksi ke Arduino Nano."""
+    port = find_arduino_port()
+    if port is None:
+        print("⚠️  Arduino tidak terdeteksi. LED tidak akan aktif.")
+        print("   Tips: Hubungkan Arduino via USB dan pastikan driver CH340 terinstall.")
+        return None
+    
+    try:
+        ard = serial.Serial(port, ARDUINO_BAUDRATE, timeout=1)
+        time.sleep(2)  # Tunggu Arduino reset selesai
+        print(f"✅  Arduino terhubung di {port}")
+        print(f"    Baudrate: {ARDUINO_BAUDRATE}")
+        # Kirim 'N' untuk memastikan LED mati saat mulai
+        ard.write(ARDUINO_CMD_OFF)
+        return ard
+    except serial.SerialException as e:
+        print(f"⚠️  Gagal membuka port {port}: {e}")
+        return None
+
+def send_to_arduino(ard, prediction_label):
+    """Kirim perintah ke Arduino berdasarkan prediksi."""
+    if ard is None or not ard.is_open:
+        return False
+    
+    cmd = ARDUINO_CMD_MAP.get(prediction_label, ARDUINO_CMD_OFF)
+    try:
+        ard.write(cmd)
+        return True
+    except serial.SerialException:
+        return False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOAD MODEL
+# ═══════════════════════════════════════════════════════════════════════════════
 print("Memuat model...")
 model = tf.keras.models.load_model(MODEL_PATH)
 print(f"✅  Model: {MODEL_PATH}")
@@ -66,7 +154,9 @@ face_cascade = cv2.CascadeClassifier(
 eye_cascade  = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_eye.xml")
 
-# ─── PREPROCESSING ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# PREPROCESSING
+# ═══════════════════════════════════════════════════════════════════════════════
 def preprocess_eye(eye_roi):
     resized   = cv2.resize(eye_roi, (IMG_SIZE, IMG_SIZE))
     clahe     = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
@@ -100,7 +190,9 @@ def predict_eyes(eye_frames):
         all_probs.append(probs)
     return np.mean(all_probs, axis=0)
 
-# ─── SMOOTHING ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# SMOOTHING
+# ═══════════════════════════════════════════════════════════════════════════════
 pred_history = []
 
 def smooth_prediction(probs):
@@ -109,9 +201,10 @@ def smooth_prediction(probs):
         pred_history.pop(0)
     return np.mean(pred_history, axis=0)
 
-# ─── HELPER DRAWING ────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPER DRAWING
+# ═══════════════════════════════════════════════════════════════════════════════
 def filled_rounded_rect(img, x, y, w, h, r, color, alpha=1.0):
-    """Rounded rect solid fill (no border)."""
     overlay = img.copy()
     cv2.rectangle(overlay, (x+r, y), (x+w-r, y+h), color, -1)
     cv2.rectangle(overlay, (x, y+r), (x+w, y+h-r), color, -1)
@@ -143,9 +236,11 @@ def draw_arc(img, cx, cy, radius, start_deg, end_deg, color, thickness=6):
 def draw_divider(img, x1, y1, x2, y2):
     cv2.line(img, (x1, y1), (x2, y2), LINE_DIM, 1, cv2.LINE_AA)
 
-# ─── PANEL BUILDERS ────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# PANEL BUILDERS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def build_topbar(frame, W, fps):
+def build_topbar(frame, W, fps, arduino_connected):
     bar = frame[:TOPBAR_H, :]
     bar[:] = (22, 22, 24)
     draw_divider(frame, 0, TOPBAR_H-1, W, TOPBAR_H-1)
@@ -158,43 +253,60 @@ def build_topbar(frame, W, fps):
     put_text(bar, "Eye Tracker", 28, TOPBAR_H//2 + 5, scale=0.50,
              color=TEXT_PRI, bold=True)
 
-    # Right info
-    rx = W - 10
+    # ── Arduino Status Indicator ─────────────────────────────────────────────
+    ard_x = W - 10
+    if arduino_connected:
+        ard_text = "Arduino ON"
+        ard_color = ACCENT_GRN
+        ard_bg = (20, 60, 20)
+    else:
+        ard_text = "Arduino OFF"
+        ard_color = ACCENT_RED
+        ard_bg = (40, 20, 20)
+    
+    (tw, _), _ = cv2.getTextSize(ard_text, cv2.FONT_HERSHEY_SIMPLEX, 0.33, 1)
+    ard_x -= tw + 8
+    filled_rounded_rect(bar, ard_x-4, 12, tw+12, 20, 3, ard_bg)
+    put_text(bar, ard_text, ard_x, TOPBAR_H//2+5, scale=0.33, color=ard_color)
+    ard_x -= 18  # space before pipe
+
+    # FPS
     fps_text = f"FPS: {fps:.0f}"
     (tw, _), _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
-    rx -= tw + 8
-    fps_box_x = rx - 4
-    filled_rounded_rect(bar, fps_box_x, 12, tw+12, 20, 3,
-                        (20, 60, 20))
-    border_rounded_rect(bar, fps_box_x, 12, tw+12, 20, 3,
-                        (40, 140, 40), 1)
-    put_text(bar, fps_text, rx, TOPBAR_H//2+5, scale=0.40, color=ACCENT_GRN)
+    ard_x -= tw + 8
+    fps_box_x = ard_x - 4
+    filled_rounded_rect(bar, fps_box_x, 12, tw+12, 20, 3, (20, 60, 20))
+    border_rounded_rect(bar, fps_box_x, 12, tw+12, 20, 3, (40, 140, 40), 1)
+    put_text(bar, fps_text, ard_x, TOPBAR_H//2+5, scale=0.40, color=ACCENT_GRN)
 
     infos = [
         f"Model: eye_tracker.h5",
         f"Input: 64x64",
         f"Window: {SMOOTH_WINDOW}f",
     ]
-    rx -= 10
+    ard_x -= 10
     for info in reversed(infos):
         (tw, _), _ = cv2.getTextSize(info, cv2.FONT_HERSHEY_SIMPLEX, 0.33, 1)
-        rx -= tw + 20
-        put_text(bar, info, rx, TOPBAR_H//2+5, scale=0.33, color=TEXT_SEC)
-        put_text(bar, "|", rx - 10, TOPBAR_H//2+5, scale=0.33, color=TEXT_DIM)
+        ard_x -= tw + 20
+        put_text(bar, info, ard_x, TOPBAR_H//2+5, scale=0.33, color=TEXT_SEC)
+        put_text(bar, "|", ard_x - 10, TOPBAR_H//2+5, scale=0.33, color=TEXT_DIM)
 
 
-def build_bottombar(frame, H, W):
+def build_bottombar(frame, H, W, arduino_port):
     by = H - BOTTOMBAR_H
     bar = frame[by:H, :]
     bar[:] = (22, 22, 24)
     draw_divider(frame, 0, by, W, by)
 
+    port_text = f"Arduino: {arduino_port}" if arduino_port else "Arduino: Not connected"
     items = [
         ("\u25b6 Kamera: /dev/video0", TEXT_SEC),
         ("|", TEXT_DIM),
         ("TF 2.x", TEXT_SEC),
         ("|", TEXT_DIM),
         ("Haar Cascade", TEXT_SEC),
+        ("|", TEXT_DIM),
+        (port_text, ACCENT_GRN if arduino_port else ACCENT_RED),
     ]
     x = 12
     for txt, col in items:
@@ -213,16 +325,13 @@ def build_left_panel(frame, H, W,
                      eye_count, eye_previews,
                      prediction_label, prediction_color,
                      conf_threshold, conf_threshold_pct):
-    """
-    Gambar panel kiri (x: 0..PANEL_LEFT_W).
-    """
     panel = frame[TOPBAR_H:H-BOTTOMBAR_H, 0:PANEL_LEFT_W]
     panel[:] = BG_PANEL
     draw_divider(frame, PANEL_LEFT_W, TOPBAR_H, PANEL_LEFT_W, H-BOTTOMBAR_H)
 
     PW = PANEL_LEFT_W
-    px = 12   # padding kiri
-    py = 14   # padding atas awal
+    px = 12
+    py = 14
 
     # ── EYE PREVIEW ────────────────────────────────────────────────────────────
     section_label(panel, "Eye Preview", px, py + 8)
@@ -244,7 +353,6 @@ def build_left_panel(frame, H, W,
             iy = py + 4
             panel[iy:iy+thumb.shape[0], bx+6:bx+6+thumb.shape[1]] = thumb
         else:
-            # placeholder mata
             cx = bx + box_w // 2
             cy = py + (box_w - 12) // 2 + 4
             pts = np.array([[bx+8, cy], [cx, py+10],
@@ -329,6 +437,27 @@ def build_left_panel(frame, H, W,
     cv2.rectangle(panel, (sl_x, sl_y), (sl_x+sl_w, sl_y+4), (55,55,60), 1)
     cv2.circle(panel, (sl_x+pos, sl_y+2), 6, ACCENT_GRN, -1, cv2.LINE_AA)
     cv2.circle(panel, (sl_x+pos, sl_y+2), 6, TEXT_PRI, 1, cv2.LINE_AA)
+
+    # ── LED STATUS ─────────────────────────────────────────────────────────────
+    py += 50
+    section_label(panel, "LED Output", px, py)
+    py += 14
+
+    filled_rounded_rect(panel, px, py, PW-px*2, 60, 6, BG_CARD)
+    border_rounded_rect(panel, px, py, PW-px*2, 60, 6, (50,50,55), 1)
+
+    led_labels = [("D9 Kiri", 0), ("D10 Mid", 1), ("D11 Kanan", 2)]
+    active_map = {"Lirik Kiri": 0, "Center": 1, "Lirik Kanan": 2}
+
+    for i, (lbl, idx) in enumerate(led_labels):
+        active = eye_count > 0 and active_map.get(prediction_label) == idx
+        lx = px + 8 + i * (PW - px*2 - 16) // 3
+        led_color = (0, 255, 0) if active else (40, 40, 45)
+        cv2.circle(panel, (lx + 6, py + 16), 5, led_color, -1, cv2.LINE_AA)
+        if active:
+            cv2.circle(panel, (lx + 6, py + 16), 5, (255,255,255), 1, cv2.LINE_AA)
+        put_text(panel, lbl, lx - 2, py + 36, scale=0.28,
+                color=ACCENT_GRN if active else TEXT_DIM)
 
 
 def build_right_panel(frame, H, W, probs, smoothed_probs,
@@ -422,11 +551,9 @@ def build_right_panel(frame, H, W, probs, smoothed_probs,
     cy = py + 58
     r  = 36
 
-    # Track
     draw_arc(frame[TOPBAR_H:H-BOTTOMBAR_H, rx0:W],
              cx, cy, r, 150, 390, (40,40,44), 7)
 
-    # Fill arc
     pred_col = label_colors_bgr.get(prediction_label, ACCENT_GRY)
     if eye_count == 0:
         pred_col = ACCENT_GRY
@@ -435,7 +562,6 @@ def build_right_panel(frame, H, W, probs, smoothed_probs,
         draw_arc(frame[TOPBAR_H:H-BOTTOMBAR_H, rx0:W],
                  cx, cy, r, 150, arc_end, pred_col, 7)
 
-    # Threshold tick
     tick_angle = 150 + int(240 * CONFIDENCE_THRESHOLD)
     tick_rad   = math.radians(tick_angle)
     tx1 = int(cx + (r-10) * math.cos(tick_rad))
@@ -469,14 +595,6 @@ def build_right_panel(frame, H, W, probs, smoothed_probs,
 
 
 def letterbox(cam_frame, target_w, target_h, bg_color=BG_VIDEO):
-    """
-    Resize cam_frame ke dalam (target_w x target_h) dengan menjaga aspect ratio.
-    Sisa area diisi bg_color (letterbox/pillarbox).
-    Returns: (canvas, scale, pad_x, pad_y)
-      scale  — faktor skala yang dipakai
-      pad_x  — offset horizontal (pillarbox kiri)
-      pad_y  — offset vertikal (letterbox atas)
-    """
     src_h, src_w = cam_frame.shape[:2]
     scale  = min(target_w / src_w, target_h / src_h)
     new_w  = int(src_w * scale)
@@ -492,11 +610,6 @@ def letterbox(cam_frame, target_w, target_h, bg_color=BG_VIDEO):
 
 def build_video_area(frame, cam_frame, H, W,
                      faces, roi_data, prediction_label, prediction_color):
-    """
-    Tempatkan frame kamera (letterbox, aspect ratio terjaga) ke area tengah.
-    Koordinat overlay diskalakan ulang sesuai letterbox.
-    cam_frame sudah di-flip (mirror) sebelum masuk ke sini.
-    """
     vx0 = PANEL_LEFT_W
     vx1 = W - PANEL_RIGHT_W
     vy0 = TOPBAR_H
@@ -506,17 +619,14 @@ def build_video_area(frame, cam_frame, H, W,
 
     video_area = frame[vy0:vy1, vx0:vx1]
 
-    # Letterbox — aspect ratio terjaga, tidak gepeng
     canvas, scale, pad_x, pad_y = letterbox(cam_frame, vw, vh)
     video_area[:] = canvas
 
     cam_h, cam_w = cam_frame.shape[:2]
 
     def cam2vid(cx, cy):
-        """Konversi koordinat kamera → koordinat video_area (sudah letterbox)."""
         return int(cx * scale + pad_x), int(cy * scale + pad_y)
 
-    # Gambar kotak wajah
     for (fx, fy, fw, fh) in faces[:1]:
         sx, sy = cam2vid(fx, fy)
         ex2, ey2 = cam2vid(fx+fw, fy+fh)
@@ -525,7 +635,6 @@ def build_video_area(frame, cam_frame, H, W,
         put_text(video_area, "wajah", sx+4, max(sy-4, 10),
                  scale=0.30, color=(100, 140, 200))
 
-    # Gambar kotak mata & pupil
     for (ex_abs, ey_abs, ew, eh, roi_h, roi_w, _cam_h, _cam_w) in roi_data:
         sx, sy   = cam2vid(ex_abs, ey_abs)
         ex2, ey2 = cam2vid(ex_abs+ew, ey_abs+eh)
@@ -538,7 +647,6 @@ def build_video_area(frame, cam_frame, H, W,
 
 
 def draw_prediction_chip(frame, H, W, prediction_label, prediction_color, confidence):
-    """Label prediksi utama di tengah atas area video."""
     vx0 = PANEL_LEFT_W
     vx1 = W - PANEL_RIGHT_W
     vy0 = TOPBAR_H
@@ -568,17 +676,30 @@ def draw_prediction_chip(frame, H, W, prediction_label, prediction_color, confid
                 prediction_color, thick, cv2.LINE_AA)
 
 
-# ─── MAIN LOOP ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════════════════
+print("=" * 60)
+print("   Eye Tracker + Arduino LED Controller")
+print("=" * 60)
+
+# ── Inisialisasi Arduino ─────────────────────────────────────────────────────
+arduino = init_arduino()
+arduino_port = arduino.port if arduino else None
+arduino_connected = arduino is not None
+
+# ── Inisialisasi Kamera ──────────────────────────────────────────────────────
 cap       = cv2.VideoCapture(0)
 prev_time = time.time()
 
-# Inisialisasi ukuran layar awal (bisa berubah saat resize)
 _, init_frame = cap.read()
 if init_frame is None:
     print("ERROR: Kamera tidak terdeteksi.")
+    if arduino:
+        arduino.close()
     exit()
 
-WIN_NAME = "Eye Tracker — Dashboard"
+WIN_NAME = "Eye Tracker — Dashboard + Arduino"
 cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
 cv2.resizeWindow(WIN_NAME, 1280, 720)
 
@@ -586,6 +707,9 @@ print("\nEye Tracker aktif. Tekan Q untuk keluar.")
 print("Tips: Pastikan wajah terkena cahaya dari depan.")
 
 conf_threshold_pct = CONFIDENCE_THRESHOLD * 100
+
+# Variabel untuk tracking perubahan prediksi (hanya kirim saat berubah)
+last_sent_label = None
 
 while True:
     ret, cam_frame = cap.read()
@@ -600,11 +724,9 @@ while True:
     frame = np.zeros((H, W, 3), dtype=np.uint8)
     frame[:] = BG_DARK
 
-    # Deteksi wajah & mata pada frame ASLI (belum diflip)
-    # agar koordinat bounding box konsisten dengan gambar aslinya.
+    # Deteksi wajah & mata pada frame ASLI
     gray = cv2.cvtColor(cam_frame, cv2.COLOR_BGR2GRAY)
 
-    # ── Deteksi Wajah ────────────────────────────────────────────────────────
     faces = face_cascade.detectMultiScale(
         gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
 
@@ -654,11 +776,23 @@ while True:
 
     confidence = float(np.max(current_probs))
 
-    # Mirror cam_frame untuk display (SETELAH deteksi selesai)
-    # Sekaligus flip koordinat wajah/mata agar overlay tetap pas
+    # ── KIRIM KE ARDUINO (hanya saat prediksi berubah) ────────────────────────
+    if eye_count > 0 and prediction_label in ARDUINO_CMD_MAP:
+        if prediction_label != last_sent_label:
+            success = send_to_arduino(arduino, prediction_label)
+            if success:
+                last_sent_label = prediction_label
+    elif eye_count == 0:
+        if last_sent_label is not None:
+            send_to_arduino(arduino, None)  # Kirim 'N' (off)
+            last_sent_label = None
+
+    # Cek koneksi Arduino
+    arduino_connected = arduino is not None and arduino.is_open
+
+    # Mirror untuk display
     cam_display = cv2.flip(cam_frame, 1)
 
-    # Mirror koordinat bounding box wajah & mata secara horizontal
     faces_flipped = []
     for (fx, fy, fw, fh) in faces[:1]:
         faces_flipped.append((cam_w - fx - fw, fy, fw, fh))
@@ -668,14 +802,14 @@ while True:
         roi_flipped.append((cam_w - ex_abs - ew, ey_abs, ew, eh,
                             roi_h, roi_w, cam_h, cam_w))
 
-    # ── FPS ─────────────────────────────────────────────────────────────────
+    # FPS
     curr_time = time.time()
     fps       = 1.0 / max(curr_time - prev_time, 1e-6)
     prev_time = curr_time
 
-    # ── Bangun UI ────────────────────────────────────────────────────────────
-    build_topbar(frame, W, fps)
-    build_bottombar(frame, H, W)
+    # Bangun UI
+    build_topbar(frame, W, fps, arduino_connected)
+    build_bottombar(frame, H, W, arduino_port)
 
     build_video_area(frame, cam_display, H, W,
                      faces_flipped, roi_flipped,
@@ -703,5 +837,14 @@ while True:
         cv2.imwrite(fname, frame)
         print(f"Screenshot disimpan: {fname}")
 
+# Cleanup
+print("\nMenutup aplikasi...")
+if arduino and arduino.is_open:
+    arduino.write(ARDUINO_CMD_OFF)  # Matikan LED saat keluar
+    time.sleep(0.1)
+    arduino.close()
+    print("🔌 Arduino disconnected.")
+
 cap.release()
 cv2.destroyAllWindows()
+print("✅  Aplikasi ditutup.")
